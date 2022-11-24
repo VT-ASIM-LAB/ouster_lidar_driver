@@ -25,7 +25,7 @@ RUN set -xe \
 && useradd -o -u ${BUILD_UID} -d ${BUILD_HOME} -rm -s /bin/bash -g build build
 
 # Install build dependencies using rosdep
-COPY --chown=build:build ouster_ros/package.xml ${OUSTER_ROS_PATH}/ouster_ros/package.xml
+COPY --chown=build:build ouster_ros/package_dummy.xml ${OUSTER_ROS_PATH}/ouster_ros/package.xml
 COPY --chown=build:build cav_msgs/package.xml ${OUSTER_ROS_PATH}/cav_msgs/package.xml
 
 RUN set -xe \
@@ -36,6 +36,8 @@ RUN set -xe \
 
 RUN sudo git clone --depth 1 https://github.com/vishnubob/wait-for-it.git ~/.base-image/wait-for-it &&\
     sudo mv ~/.base-image/wait-for-it/wait-for-it.sh /usr/bin
+
+RUN rm ${OUSTER_ROS_PATH}/ouster_ros/package.xml
 
 # Set up build environment
 COPY --chown=build:build ouster_ros ${OUSTER_ROS_PATH}/ouster_ros

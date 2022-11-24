@@ -18,6 +18,7 @@
 #include <ros/ros.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <cav_msgs/DriverStatus.h>
 #include <tf2_ros/transform_broadcaster.h>
 
 #include <algorithm>
@@ -28,167 +29,212 @@
 #include "ouster_ros/PacketMsg.h"
 
 namespace sensor = ouster::sensor;
+
 using ouster_ros::PacketMsg;
 using sensor::UDPProfileLidar;
 using namespace std::chrono_literals;
 
 namespace nodelets_os {
-class OusterCloud : public nodelet::Nodelet {
-   private:
-    bool is_arg_set(const std::string& arg) {
-        return arg.find_first_not_of(' ') != std::string::npos;
-    }
+    class OusterCloud : public nodelet::Nodelet {
+        private:
+            bool is_arg_set(const std::string& arg) {
+                return arg.find_first_not_of(' ') != std::string::npos;
+            }
 
-    virtual void onInit() override {
-        auto& pnh = getPrivateNodeHandle();
-        auto tf_prefix = pnh.param("tf_prefix", std::string{});
-        if (is_arg_set(tf_prefix) && tf_prefix.back() != '/')
-            tf_prefix.append("/");
-        sensor_frame = tf_prefix + "os_sensor";
-        imu_frame = tf_prefix + "os_imu";
-        lidar_frame = tf_prefix + "os_lidar";
-        auto timestamp_mode_arg = pnh.param("timestamp_mode", std::string{});
-        use_ros_time = timestamp_mode_arg == "TIME_FROM_ROS_TIME";
+            virtual void onInit() override {
+                auto& pnh = getPrivateNodeHandle();
+                auto tf_prefix = pnh.param("tf_prefix", std::string{});
+                
+                if (is_arg_set(tf_prefix) && tf_prefix.back() != '/')
+                    tf_prefix.append("/");
+                
+                sensor_frame = tf_prefix + "velodyne";
+                imu_frame = tf_prefix + "os_imu";
+                lidar_frame = tf_prefix + "os_lidar";
 
-        auto& nh = getNodeHandle();
-        ouster_ros::GetMetadata metadata{};
-        auto client = nh.serviceClient<ouster_ros::GetMetadata>("get_metadata");
-        client.waitForExistence();
-        if (!client.call(metadata)) {
-            auto error_msg = "OusterCloud: Calling get_metadata service failed";
-            NODELET_ERROR_STREAM(error_msg);
-            throw std::runtime_error(error_msg);
-        }
+                auto timestamp_mode_arg = pnh.param("timestamp_mode", std::string{});
+                use_ros_time = timestamp_mode_arg == "TIME_FROM_ROS_TIME";
 
-        NODELET_INFO("OusterCloud: retrieved sensor metadata!");
+                discovery_msg.name = "/hardware_interface/lidar";
+                discovery_msg.lidar = true;
 
-        info = sensor::parse_metadata(metadata.response.metadata);
-        uint32_t H = info.format.pixels_per_column;
-        uint32_t W = info.format.columns_per_frame;
+                auto& nh = getNodeHandle();
 
-        n_returns = info.format.udp_profile_lidar ==
-                            UDPProfileLidar::PROFILE_RNG19_RFL8_SIG16_NIR16_DUAL
-                        ? 2
-                        : 1;
+                ouster_ros::GetMetadata metadata{};
 
-        NODELET_INFO_STREAM("Profile has " << n_returns << " return(s)");
+                auto client = nh.serviceClient<ouster_ros::GetMetadata>("get_metadata");
+                
+                client.waitForExistence();
+                
+                if (!client.call(metadata)) {
+                    auto error_msg = "OusterCloud: Calling get_metadata service failed";
+                    
+                    discovery_msg.status = cav_msgs::DriverStatus::FAULT;
+                    
+                    NODELET_ERROR_STREAM(error_msg);
+                    throw std::runtime_error(error_msg);
+                }
 
-        imu_pub = nh.advertise<sensor_msgs::Imu>("imu", 100);
+                NODELET_INFO("OusterCloud: retrieved sensor metadata!");
 
-        auto img_suffix = [](int ind) {
-            if (ind == 0) return std::string();
-            return std::to_string(ind + 1);  // need second return to return 2
-        };
+                info = sensor::parse_metadata(metadata.response.metadata);
+                uint32_t H = info.format.pixels_per_column;
+                uint32_t W = info.format.columns_per_frame;
 
-        lidar_pubs.resize(n_returns);
-        for (int i = 0; i < n_returns; i++) {
-            auto pub = nh.advertise<sensor_msgs::PointCloud2>(
-                std::string("points") + img_suffix(i), 10);
-            lidar_pubs[i] = pub;
-        }
+                n_returns = info.format.udp_profile_lidar ==
+                                    UDPProfileLidar::PROFILE_RNG19_RFL8_SIG16_NIR16_DUAL
+                                ? 2
+                                : 1;
 
-        xyz_lut = ouster::make_xyz_lut(info);
+                NODELET_INFO_STREAM("Profile has " << n_returns << " return(s)");
 
-        ls = ouster::LidarScan{W, H, info.format.udp_profile_lidar};
-        cloud = ouster_ros::Cloud{W, H};
+                imu_pub = nh.advertise<sensor_msgs::Imu>("imu", 100);
 
-        scan_batcher = std::make_unique<ouster::ScanBatcher>(info);
+                auto img_suffix = [](int ind) {
+                    if (ind == 0) return std::string();
+                    return std::to_string(ind + 1);  // need second return to return 2
+                };
 
-        auto lidar_handler = use_ros_time
-                                 ? &OusterCloud::lidar_handler_ros_time
-                                 : &OusterCloud::lidar_handler_sensor_time;
+                lidar_pubs.resize(n_returns);
+                for (int i = 0; i < n_returns; i++) {
+                    auto pub = nh.advertise<sensor_msgs::PointCloud2>(
+                        std::string("points") + img_suffix(i), 10);
+                    lidar_pubs[i] = pub;
+                }
 
-        lidar_packet_sub =
-            nh.subscribe<PacketMsg>("lidar_packets", 2048, lidar_handler, this);
-        imu_packet_sub = nh.subscribe<PacketMsg>(
-            "imu_packets", 100, &OusterCloud::imu_handler, this);
-    }
+                discovery_pub = nh.advertise<cav_msgs::DriverStatus>("discovery", 10);
 
-    void convert_scan_to_pointcloud_publish(std::chrono::nanoseconds scan_ts,
-                                            const ros::Time& msg_ts) {
-        for (int i = 0; i < n_returns; ++i) {
-            scan_to_cloud(xyz_lut, scan_ts, ls, cloud, i);
-            sensor_msgs::PointCloud2 pc =
-                ouster_ros::cloud_to_cloud_msg(cloud, msg_ts, sensor_frame);
-            sensor_msgs::PointCloud2Ptr pc_ptr =
-                boost::make_shared<sensor_msgs::PointCloud2>(pc);
-            lidar_pubs[i].publish(pc_ptr);
-        }
+                last_discovery_pub = ros::Time::now();
 
-        tf_bcast.sendTransform(ouster_ros::transform_to_tf_msg(
-            info.lidar_to_sensor_transform, sensor_frame, lidar_frame, msg_ts));
-    }
+                xyz_lut = ouster::make_xyz_lut(info);
 
-    void lidar_handler_sensor_time(const PacketMsg::ConstPtr& packet) {
-        if (!(*scan_batcher)(packet->buf.data(), ls)) return;
-        auto ts_v = ls.timestamp();
-        auto idx = std::find_if(ts_v.data(), ts_v.data() + ts_v.size(),
-                                [](uint64_t h) { return h != 0; });
-        if (idx == ts_v.data() + ts_v.size()) return;
-        auto scan_ts = std::chrono::nanoseconds{ts_v(idx - ts_v.data())};
-        convert_scan_to_pointcloud_publish(scan_ts, to_ros_time(scan_ts));
-    }
+                ls = ouster::LidarScan{W, H, info.format.udp_profile_lidar};
+                cloud = ouster_ros::Cloud{W, H};
 
-    void lidar_handler_ros_time(const PacketMsg::ConstPtr& packet) {
-        auto packet_receive_time = ros::Time::now();
-        static auto frame_ts = packet_receive_time;  // first point cloud time
-        if (!(*scan_batcher)(packet->buf.data(), ls)) return;
-        auto ts_v = ls.timestamp();
-        auto idx = std::find_if(ts_v.data(), ts_v.data() + ts_v.size(),
-                                [](uint64_t h) { return h != 0; });
-        if (idx == ts_v.data() + ts_v.size()) return;
-        auto scan_ts = std::chrono::nanoseconds{ts_v(idx - ts_v.data())};
-        convert_scan_to_pointcloud_publish(scan_ts, frame_ts);
-        frame_ts = packet_receive_time;  // set time for next point cloud msg
-    }
+                scan_batcher = std::make_unique<ouster::ScanBatcher>(info);
 
-    void imu_handler(const PacketMsg::ConstPtr& packet) {
-        auto pf = sensor::get_format(info);
-        ros::Time msg_ts =
-            use_ros_time ? ros::Time::now()
-                         : to_ros_time(pf.imu_gyro_ts(packet->buf.data()));
-        sensor_msgs::Imu imu_msg =
-            ouster_ros::packet_to_imu_msg(*packet, msg_ts, imu_frame, pf);
-        sensor_msgs::ImuPtr imu_msg_ptr =
-            boost::make_shared<sensor_msgs::Imu>(imu_msg);
-        imu_pub.publish(imu_msg_ptr);
+                auto lidar_handler = use_ros_time
+                                        ? &OusterCloud::lidar_handler_ros_time
+                                        : &OusterCloud::lidar_handler_sensor_time;
 
-        tf_bcast.sendTransform(ouster_ros::transform_to_tf_msg(
-            info.imu_to_sensor_transform, sensor_frame, imu_frame, msg_ts));
+                lidar_packet_sub = nh.subscribe<PacketMsg>(
+                    "lidar_packets", 2048, lidar_handler, this);
+                imu_packet_sub = nh.subscribe<PacketMsg>(
+                    "imu_packets", 100, &OusterCloud::imu_handler, this);
+            }
+
+            void convert_scan_to_pointcloud_publish(std::chrono::nanoseconds scan_ts,
+                                                    const ros::Time& msg_ts) {
+                for (int i = 0; i < n_returns; ++i) {
+                    scan_to_cloud(xyz_lut, scan_ts, ls, cloud, i);
+                    sensor_msgs::PointCloud2 pc =
+                        ouster_ros::cloud_to_cloud_msg(cloud, msg_ts, sensor_frame);
+                    sensor_msgs::PointCloud2Ptr pc_ptr =
+                        boost::make_shared<sensor_msgs::PointCloud2>(pc);
+                    lidar_pubs[i].publish(pc_ptr);
+                }
+
+                tf_bcast.sendTransform(ouster_ros::transform_to_tf_msg(
+                    info.lidar_to_sensor_transform, sensor_frame, lidar_frame, msg_ts));
+
+                discovery_msg.status = cav_msgs::DriverStatus::OPERATIONAL;
+
+                if (last_discovery_pub == ros::Time(0) ||
+                    (ros::Time::now() - last_discovery_pub).toSec() > 0.8) {
+                    discovery_pub.publish(discovery_msg);
+                    last_discovery_pub = ros::Time::now();
+                }
+            }
+
+            void lidar_handler_sensor_time(const PacketMsg::ConstPtr& packet) {
+                if (!(*scan_batcher)(packet->buf.data(), ls)) return;
+                
+                auto ts_v = ls.timestamp();
+                auto idx = std::find_if(ts_v.data(), ts_v.data() + ts_v.size(),
+                                        [](uint64_t h) { return h != 0; });
+                
+                if (idx == ts_v.data() + ts_v.size()) return;
+                
+                auto scan_ts = std::chrono::nanoseconds{ts_v(idx - ts_v.data())};
+                
+                convert_scan_to_pointcloud_publish(scan_ts, to_ros_time(scan_ts));
+            }
+
+            void lidar_handler_ros_time(const PacketMsg::ConstPtr& packet) {
+                auto packet_receive_time = ros::Time::now();
+                static auto frame_ts = packet_receive_time;  // first point cloud time
+                
+                if (!(*scan_batcher)(packet->buf.data(), ls)) return;
+                
+                auto ts_v = ls.timestamp();
+                auto idx = std::find_if(ts_v.data(), ts_v.data() + ts_v.size(),
+                                        [](uint64_t h) { return h != 0; });
+                
+                if (idx == ts_v.data() + ts_v.size()) return;
+                
+                auto scan_ts = std::chrono::nanoseconds{ts_v(idx - ts_v.data())};
+                
+                convert_scan_to_pointcloud_publish(scan_ts, frame_ts);
+                
+                frame_ts = packet_receive_time;  // set time for next point cloud msg
+            }
+
+            void imu_handler(const PacketMsg::ConstPtr& packet) {
+                auto pf = sensor::get_format(info);
+                
+                ros::Time msg_ts =
+                    use_ros_time ? ros::Time::now()
+                                : to_ros_time(pf.imu_gyro_ts(packet->buf.data()));
+                sensor_msgs::Imu imu_msg =
+                    ouster_ros::packet_to_imu_msg(*packet, msg_ts, imu_frame, pf);
+                sensor_msgs::ImuPtr imu_msg_ptr =
+                    boost::make_shared<sensor_msgs::Imu>(imu_msg);
+                
+                imu_pub.publish(imu_msg_ptr);
+
+                tf_bcast.sendTransform(ouster_ros::transform_to_tf_msg(
+                    info.imu_to_sensor_transform, sensor_frame, imu_frame, msg_ts));
+            };
+
+            inline ros::Time to_ros_time(uint64_t ts) {
+                ros::Time t;
+                t.fromNSec(ts);
+                return t;
+            }
+
+            inline ros::Time to_ros_time(std::chrono::nanoseconds ts) {
+                return to_ros_time(ts.count());
+            }
+
+        private:
+            ros::Subscriber lidar_packet_sub;
+            std::vector<ros::Publisher> lidar_pubs;
+            ros::Subscriber imu_packet_sub;
+            ros::Publisher imu_pub;
+            ros::Publisher discovery_pub;
+
+            sensor::sensor_info info;
+            
+            int n_returns = 0;
+
+            ouster::XYZLut xyz_lut;
+            ouster::LidarScan ls;
+            ouster_ros::Cloud cloud;
+            
+            std::unique_ptr<ouster::ScanBatcher> scan_batcher;
+
+            std::string sensor_frame;
+            std::string imu_frame;
+            std::string lidar_frame;
+
+            tf2_ros::TransformBroadcaster tf_bcast;
+
+            cav_msgs::DriverStatus discovery_msg;
+
+            ros::Time last_discovery_pub;
+
+            bool use_ros_time;
     };
-
-    inline ros::Time to_ros_time(uint64_t ts) {
-        ros::Time t;
-        t.fromNSec(ts);
-        return t;
-    }
-
-    inline ros::Time to_ros_time(std::chrono::nanoseconds ts) {
-        return to_ros_time(ts.count());
-    }
-
-   private:
-    ros::Subscriber lidar_packet_sub;
-    std::vector<ros::Publisher> lidar_pubs;
-    ros::Subscriber imu_packet_sub;
-    ros::Publisher imu_pub;
-
-    sensor::sensor_info info;
-    int n_returns = 0;
-
-    ouster::XYZLut xyz_lut;
-    ouster::LidarScan ls;
-    ouster_ros::Cloud cloud;
-    std::unique_ptr<ouster::ScanBatcher> scan_batcher;
-
-    std::string sensor_frame;
-    std::string imu_frame;
-    std::string lidar_frame;
-
-    tf2_ros::TransformBroadcaster tf_bcast;
-
-    bool use_ros_time;
-};
 }  // namespace nodelets_os
 
 PLUGINLIB_EXPORT_CLASS(nodelets_os::OusterCloud, nodelet::Nodelet)
