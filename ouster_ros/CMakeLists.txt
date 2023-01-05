@@ -19,6 +19,7 @@ find_package(
              std_msgs
              sensor_msgs
              geometry_msgs
+             cav_msgs
              pcl_conversions
              roscpp
              tf2
@@ -34,7 +35,7 @@ option(CMAKE_POSITION_INDEPENDENT_CODE "Build position independent code." ON)
 # ==== Catkin ====
 add_message_files(FILES PacketMsg.msg)
 add_service_files(FILES GetConfig.srv SetConfig.srv GetMetadata.srv)
-generate_messages(DEPENDENCIES std_msgs sensor_msgs geometry_msgs)
+generate_messages(DEPENDENCIES std_msgs sensor_msgs geometry_msgs cav_msgs)
 
 set(_ouster_ros_INCLUDE_DIRS
   "include;ouster-sdk/ouster_client/include;ouster-sdk/ouster_client/include/optional-lite")

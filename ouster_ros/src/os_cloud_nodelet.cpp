@@ -18,6 +18,7 @@
 #include <ros/ros.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <cav_msgs/DriverStatus.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <pcl_conversions/pcl_conversions.h>
 
@@ -45,11 +46,14 @@ class OusterCloud : public nodelet::Nodelet {
         auto tf_prefix = pnh.param("tf_prefix", std::string{});
         if (is_arg_set(tf_prefix) && tf_prefix.back() != '/')
             tf_prefix.append("/");
-        sensor_frame = tf_prefix + "os_sensor";
+        sensor_frame = tf_prefix + "velodyne";
         imu_frame = tf_prefix + "os_imu";
         lidar_frame = tf_prefix + "os_lidar";
         auto timestamp_mode_arg = pnh.param("timestamp_mode", std::string{});
         use_ros_time = timestamp_mode_arg == "TIME_FROM_ROS_TIME";
+
+        discovery_msg.name = "/hardware_interface/lidar";
+        discovery_msg.lidar = true;
 
         auto& nh = getNodeHandle();
         ouster_ros::GetMetadata metadata{};
@@ -57,6 +61,7 @@ class OusterCloud : public nodelet::Nodelet {
         client.waitForExistence();
         if (!client.call(metadata)) {
             auto error_msg = "OusterCloud: Calling get_metadata service failed";
+            discovery_msg.status = cav_msgs::DriverStatus::FAULT;
             NODELET_ERROR_STREAM(error_msg);
             throw std::runtime_error(error_msg);
         }
@@ -87,6 +92,9 @@ class OusterCloud : public nodelet::Nodelet {
                 std::string("points") + img_suffix(i), 10);
             lidar_pubs[i] = pub;
         }
+
+        discovery_pub = nh.advertise<cav_msgs::DriverStatus>("discovery", 10);
+        last_discovery_pub = ros::Time::now();
 
         // The ouster_ros drive currently only uses single precision when it
         // produces the point cloud. So it isn't of a benefit to compute point
@@ -131,6 +139,14 @@ class OusterCloud : public nodelet::Nodelet {
 
         tf_bcast.sendTransform(ouster_ros::transform_to_tf_msg(
             info.lidar_to_sensor_transform, sensor_frame, lidar_frame, msg_ts));
+
+        discovery_msg.status = cav_msgs::DriverStatus::OPERATIONAL;
+
+        if (last_discovery_pub == ros::Time(0) ||
+            (ros::Time::now() - last_discovery_pub).toSec() > 0.8) {
+            discovery_pub.publish(discovery_msg);
+            last_discovery_pub = ros::Time::now();
+        }
     }
 
     void lidar_handler_sensor_time(const PacketMsg::ConstPtr& packet) {
