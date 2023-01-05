@@ -202,6 +202,7 @@ class OusterCloud : public nodelet::Nodelet {
     std::vector<ros::Publisher> lidar_pubs;
     ros::Subscriber imu_packet_sub;
     ros::Publisher imu_pub;
+    ros::Publisher discovery_pub;
     sensor_msgs::PointCloud2::Ptr pc_ptr;
 
 
@@ -220,6 +221,10 @@ class OusterCloud : public nodelet::Nodelet {
     std::string lidar_frame;
 
     tf2_ros::TransformBroadcaster tf_bcast;
+
+    cav_msgs::DriverStatus discovery_msg;
+    
+    ros::Time last_discovery_pub;
 
     bool use_ros_time;
 };

@@ -11,8 +11,8 @@
       output="screen" required="true"
       launch-prefix="bash -c 'sleep 4; $0 $@' "
       args="load nodelets_os/OusterCloud os_nodelet_mgr">
-      <remap from="~/points" to="/hardware_interface/lidar/points_raw"/>
-      <remap from="~/discovery" to="/hardware_interface/driver_discovery"/>
+      <remap from="points" to="/hardware_interface/lidar/points_raw"/>
+      <remap from="discovery" to="/hardware_interface/driver_discovery"/>
       <param name="~/tf_prefix" type="str" value="$(arg tf_prefix)"/>
       <param name="~/timestamp_mode" type="str" value="$(arg timestamp_mode)"/>
     </node>
@@ -23,7 +23,7 @@
       output="screen" required="true"
       launch-prefix="bash -c 'sleep 4; $0 $@' "
       args="load nodelets_os/OusterImage os_nodelet_mgr">
-      <remap from="~/points" to="/hardware_interface/lidar/points_raw"/>
+      <remap from="points" to="/hardware_interface/lidar/points_raw"/>
     </node>
   </group>
 
